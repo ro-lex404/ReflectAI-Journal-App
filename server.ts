@@ -232,6 +232,61 @@ Your goal in 'brainstorm' mode:
   }
 });
 
+// Google Geolocation API Proxy Endpoint (for keys restricted to Geolocation API)
+app.post('/api/geolocation/lookup', async (req: Request, res: Response) => {
+  try {
+    const rawBody = req.body && typeof req.body === 'object' ? req.body : {};
+    const apiKey = (
+      process.env.GOOGLE_MAPS_API_KEY ||
+      process.env.VITE_GOOGLE_MAPS_API_KEY ||
+      rawBody.apiKey ||
+      ''
+    ).trim();
+
+    if (!apiKey) {
+      return res.status(400).json({
+        error: 'Google Geolocation API key is not configured in server environment or request.',
+      });
+    }
+
+    // Call Google's Geolocation API
+    const googleRes = await fetch(
+      `https://www.googleapis.com/geolocation/v1/geolocate?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          considerIp: true,
+          ...(rawBody.wifiAccessPoints ? { wifiAccessPoints: rawBody.wifiAccessPoints } : {}),
+          ...(rawBody.cellTowers ? { cellTowers: rawBody.cellTowers } : {}),
+        }),
+      }
+    );
+
+    if (!googleRes.ok) {
+      const errText = await googleRes.text().catch(() => '');
+      return res.status(googleRes.status).json({
+        error: `Google Geolocation API returned HTTP ${googleRes.status}: ${errText}`,
+      });
+    }
+
+    const data: any = await googleRes.json();
+    if (data.location && typeof data.location.lat === 'number' && typeof data.location.lng === 'number') {
+      return res.json({
+        success: true,
+        latitude: data.location.lat,
+        longitude: data.location.lng,
+        accuracy: data.accuracy,
+      });
+    }
+
+    return res.status(502).json({ error: 'Invalid response from Google Geolocation API.' });
+  } catch (error: any) {
+    console.error('API /api/geolocation/lookup error:', error);
+    res.status(500).json({ error: error?.message || 'Failed to query Google Geolocation API.' });
+  }
+});
+
 async function startServer() {
   // Integrate Vite middleware in development
   if (process.env.NODE_ENV !== 'production') {

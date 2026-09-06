@@ -1,6 +1,6 @@
 {
   "name": "ReflectAI Journal",
   "description": "Secure, user-authenticated personal reflection and journaling application powered by Gemini 3.6 Flash and Cloud Firestore.",
-  "requestFramePermissions": [],
+  "requestFramePermissions": ["geolocation"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

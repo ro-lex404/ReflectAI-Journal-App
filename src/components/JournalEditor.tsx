@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Markdown from 'react-markdown';
 import {
   Send,
@@ -16,10 +16,14 @@ import {
   PanelLeft,
   Trash2,
   X,
+  MapPin,
+  AlertCircle,
+  Save,
 } from 'lucide-react';
-import type { Interaction, ReflectionMode, ChatMessage, UserProfile } from '../types';
+import type { Interaction, ReflectionMode, ChatMessage, UserProfile, JournalLocation } from '../types';
 import { saveUserInteraction } from '../lib/firebase';
 import { ErrorBanner } from './ErrorBanner';
+import { LocationPickerModal } from './LocationPickerModal';
 
 interface JournalEditorProps {
   user: UserProfile;
@@ -43,12 +47,16 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [tags, setTags] = useState<string[]>([]);
   const [summary, setSummary] = useState<string>('');
+  const [location, setLocation] = useState<JournalLocation | undefined>(currentInteraction?.location);
+  const [showLocationModal, setShowLocationModal] = useState(false);
 
   // Input state
   const [inputText, setInputText] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'unsaved' | 'saving' | 'saved' | 'error'>('idle');
+  const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [modelUsedBadge, setModelUsedBadge] = useState<string>('gemini-3.6-flash');
@@ -58,8 +66,42 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
   const [isDeleting, setIsDeleting] = useState(false);
   const [deleteModalError, setDeleteModalError] = useState<string | null>(null);
 
+  // Autosave timer and snapshot tracking refs
+  const autosaveTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const lastSavedSnapshotRef = useRef<string>('');
+  const isInitialMountRef = useRef<boolean>(true);
+
+  // Helper to serialize content state for snapshot comparison
+  const createSnapshot = (
+    t: string,
+    inp: string,
+    m: ReflectionMode,
+    tg: string[],
+    loc?: JournalLocation,
+    msgsLen: number = 0
+  ) => {
+    return JSON.stringify({
+      title: t.trim(),
+      inputText: inp.trim(),
+      mode: m,
+      tags: tg,
+      location: loc
+        ? {
+            lat: loc.latitude,
+            lng: loc.longitude,
+            name: loc.name,
+            addr: loc.address,
+          }
+        : null,
+      messagesCount: msgsLen,
+    });
+  };
+
   const handleConfirmEditorDelete = async () => {
     if (!activeId || !onDeleteInteraction) return;
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+    }
     try {
       setIsDeleting(true);
       setDeleteModalError(null);
@@ -72,6 +114,9 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
       setTags([]);
       setSummary('');
       setInputText('');
+      setLocation(undefined);
+      setSaveStatus('idle');
+      lastSavedSnapshotRef.current = createSnapshot('', '', 'reflect', [], undefined, 0);
     } catch (err) {
       console.error('Failed to delete reflection from editor:', err);
       setDeleteModalError(
@@ -90,19 +135,130 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // Keep a reference to current editing state so pending drafts can be flushed before switching
+  const stateRef = useRef({
+    activeId,
+    title,
+    inputText,
+    mode,
+    tags,
+    location,
+    messages,
+    summary,
+    currentInteraction,
+  });
+
+  useEffect(() => {
+    stateRef.current = {
+      activeId,
+      title,
+      inputText,
+      mode,
+      tags,
+      location,
+      messages,
+      summary,
+      currentInteraction,
+    };
+  });
+
   // Synchronize when currentInteraction prop changes (e.g. user clicked an entry in history)
   useEffect(() => {
     if (currentInteraction) {
-      setActiveId(currentInteraction.id);
-      setTitle(currentInteraction.title || 'Untitled Reflection');
-      setMode(currentInteraction.mode || 'reflect');
-      setMessages(currentInteraction.messages || []);
-      setTags(currentInteraction.tags || []);
-      setSummary(currentInteraction.summary || '');
-      setErrorMessage(null);
-      setSaveStatus('saved');
+      // Only switch content if selecting a DIFFERENT entry to prevent typing clobbers
+      if (activeId !== currentInteraction.id) {
+        if (autosaveTimerRef.current) {
+          clearTimeout(autosaveTimerRef.current);
+        }
+
+        // Flush draft of the PREVIOUS entry before switching so user doesn't lose text
+        const prev = stateRef.current;
+        if (
+          prev.activeId &&
+          prev.activeId !== currentInteraction.id &&
+          (prev.inputText.trim() || prev.title.trim())
+        ) {
+          const oldDerivedTitle =
+            prev.title.trim() ||
+            (prev.inputText.length > 50 ? `${prev.inputText.slice(0, 47)}...` : prev.inputText) ||
+            'Untitled Reflection';
+          saveUserInteraction(
+            user.uid,
+            {
+              title: oldDerivedTitle,
+              initialPrompt: prev.messages[0]?.content || prev.inputText || 'Reflection',
+              draftInput: prev.inputText,
+              mode: prev.mode,
+              messages: prev.messages,
+              tags: prev.tags,
+              summary: prev.summary,
+              location: prev.location,
+              createdAt: prev.currentInteraction?.createdAt || Date.now(),
+              updatedAt: Date.now(),
+            },
+            prev.activeId
+          ).catch((err) => console.error('Error saving outgoing reflection draft:', err));
+        }
+
+        setActiveId(currentInteraction.id);
+        setTitle(currentInteraction.title || 'Untitled Reflection');
+        setMode(currentInteraction.mode || 'reflect');
+        setMessages(currentInteraction.messages || []);
+        setTags(currentInteraction.tags || []);
+        setSummary(currentInteraction.summary || '');
+        setLocation(currentInteraction.location);
+
+        // Restore draft text so the user resumes right where they left off
+        const restoredDraft =
+          currentInteraction.draftInput ??
+          (currentInteraction.messages?.length === 0 ? currentInteraction.initialPrompt : '') ??
+          '';
+        setInputText(restoredDraft);
+
+        setErrorMessage(null);
+        setSaveStatus('saved');
+        setLastSavedAt(currentInteraction.updatedAt || currentInteraction.createdAt || Date.now());
+
+        lastSavedSnapshotRef.current = createSnapshot(
+          currentInteraction.title || 'Untitled Reflection',
+          restoredDraft,
+          currentInteraction.mode || 'reflect',
+          currentInteraction.tags || [],
+          currentInteraction.location,
+          (currentInteraction.messages || []).length
+        );
+      }
     } else {
-      // New empty reflection
+      // New empty reflection requested
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+      }
+
+      // Flush draft of the previous entry before starting fresh
+      const prev = stateRef.current;
+      if (prev.activeId && (prev.inputText.trim() || prev.title.trim())) {
+        const oldDerivedTitle =
+          prev.title.trim() ||
+          (prev.inputText.length > 50 ? `${prev.inputText.slice(0, 47)}...` : prev.inputText) ||
+          'Untitled Reflection';
+        saveUserInteraction(
+          user.uid,
+          {
+            title: oldDerivedTitle,
+            initialPrompt: prev.messages[0]?.content || prev.inputText || 'Reflection',
+            draftInput: prev.inputText,
+            mode: prev.mode,
+            messages: prev.messages,
+            tags: prev.tags,
+            summary: prev.summary,
+            location: prev.location,
+            createdAt: prev.currentInteraction?.createdAt || Date.now(),
+            updatedAt: Date.now(),
+          },
+          prev.activeId
+        ).catch((err) => console.error('Error saving outgoing reflection draft:', err));
+      }
+
       setActiveId(null);
       setTitle('');
       setMode('reflect');
@@ -110,10 +266,155 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
       setTags([]);
       setSummary('');
       setInputText('');
+      setLocation(undefined);
       setErrorMessage(null);
       setSaveStatus('idle');
+      setLastSavedAt(null);
+
+      lastSavedSnapshotRef.current = createSnapshot('', '', 'reflect', [], undefined, 0);
     }
-  }, [currentInteraction]);
+  }, [currentInteraction, user.uid]);
+
+  // Core autosave execution logic
+  const performAutosave = useCallback(
+    async (force = false) => {
+      if (isSaving || isProcessing) return;
+
+      const currentTitle = title.trim();
+      const currentInput = inputText.trim();
+      const hasContent = Boolean(currentTitle || currentInput || messages.length > 0 || location);
+
+      if (!hasContent) return;
+
+      const currentSnapshot = createSnapshot(
+        title,
+        inputText,
+        mode,
+        tags,
+        location,
+        messages.length
+      );
+
+      if (!force && currentSnapshot === lastSavedSnapshotRef.current) {
+        return;
+      }
+
+      try {
+        setIsSaving(true);
+        setSaveStatus('saving');
+        setSaveError(null);
+
+        const derivedTitle = currentTitle
+          ? currentTitle
+          : currentInput.length > 50
+          ? `${currentInput.slice(0, 47)}...`
+          : currentInput || 'Untitled Reflection';
+
+        const payload = {
+          title: derivedTitle,
+          initialPrompt: messages[0]?.content || currentInput || 'Reflection',
+          draftInput: inputText, // Persisted so conversation text is never lost on click-off
+          mode,
+          messages,
+          tags,
+          summary,
+          location: location
+            ? {
+                latitude: location.latitude,
+                longitude: location.longitude,
+                name: location.name,
+                address: location.address,
+                accuracy: location.accuracy,
+                timestamp: location.timestamp || Date.now(),
+              }
+            : undefined,
+          createdAt: currentInteraction?.createdAt || Date.now(),
+          updatedAt: Date.now(),
+        };
+
+        const savedDocId = await saveUserInteraction(user.uid, payload, activeId || undefined);
+        setActiveId(savedDocId);
+        lastSavedSnapshotRef.current = currentSnapshot;
+        setLastSavedAt(Date.now());
+        setSaveStatus('saved');
+
+        onSaveSuccess({
+          ...payload,
+          id: savedDocId,
+          userId: user.uid,
+        });
+      } catch (err) {
+        console.error('Autosave failed:', err);
+        setSaveStatus('error');
+        setSaveError(err instanceof Error ? err.message : 'Save failed');
+      } finally {
+        setIsSaving(false);
+      }
+    },
+    [
+      isSaving,
+      isProcessing,
+      title,
+      inputText,
+      messages,
+      location,
+      mode,
+      tags,
+      summary,
+      currentInteraction,
+      user.uid,
+      activeId,
+      onSaveSuccess,
+    ]
+  );
+
+  // Debounced Autosave Trigger: Watches title, input, tags, mode, location
+  useEffect(() => {
+    // Avoid triggering on first component mount
+    if (isInitialMountRef.current) {
+      isInitialMountRef.current = false;
+      return;
+    }
+
+    const currentTitle = title.trim();
+    const currentInput = inputText.trim();
+    const hasContent = Boolean(currentTitle || currentInput || messages.length > 0 || location);
+
+    if (!hasContent) {
+      return;
+    }
+
+    const currentSnapshot = createSnapshot(
+      title,
+      inputText,
+      mode,
+      tags,
+      location,
+      messages.length
+    );
+
+    if (currentSnapshot === lastSavedSnapshotRef.current) {
+      return;
+    }
+
+    // Mark as unsaved changes pending autosave
+    setSaveStatus('unsaved');
+
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+    }
+
+    // Debounce interval: 1500ms
+    autosaveTimerRef.current = setTimeout(() => {
+      performAutosave();
+    }, 1500);
+
+    return () => {
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+      }
+    };
+  }, [title, inputText, mode, tags, location, messages.length, performAutosave]);
 
   // Auto scroll to latest message
   useEffect(() => {
@@ -133,25 +434,7 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
       e.preventDefault();
       const sanitized = tagInput.trim().toLowerCase().replace(/[^a-z0-9-]/g, '');
       if (sanitized && !tags.includes(sanitized)) {
-        const nextTags = [...tags, sanitized];
-        setTags(nextTags);
-        // Auto-save tag update if document exists
-        if (activeId) {
-          saveUserInteraction(
-            user.uid,
-            {
-              title: title || 'Untitled Reflection',
-              initialPrompt: messages[0]?.content || inputText || 'Reflection',
-              mode,
-              messages,
-              tags: nextTags,
-              summary,
-              createdAt: currentInteraction?.createdAt || Date.now(),
-              updatedAt: Date.now(),
-            },
-            activeId
-          ).catch((err) => console.error('Error saving tag:', err));
-        }
+        setTags((prev) => [...prev, sanitized]);
       }
       setTagInput('');
       setShowTagInput(false);
@@ -159,24 +442,7 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
   };
 
   const handleRemoveTag = (tagToRemove: string) => {
-    const nextTags = tags.filter((t) => t !== tagToRemove);
-    setTags(nextTags);
-    if (activeId) {
-      saveUserInteraction(
-        user.uid,
-        {
-          title: title || 'Untitled Reflection',
-          initialPrompt: messages[0]?.content || inputText || 'Reflection',
-          mode,
-          messages,
-          tags: nextTags,
-          summary,
-          createdAt: currentInteraction?.createdAt || Date.now(),
-          updatedAt: Date.now(),
-        },
-        activeId
-      ).catch((err) => console.error('Error saving tag:', err));
-    }
+    setTags((prev) => prev.filter((t) => t !== tagToRemove));
   };
 
   /**
@@ -262,35 +528,54 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
       setIsSaving(true);
       setSaveStatus('saving');
 
-      const savedDocId = await saveUserInteraction(
-        user.uid,
-        {
-          title: derivedTitle,
-          initialPrompt: finalMessages[0]?.content || pendingText,
-          summary: finalSummary,
-          tags: combinedTags,
-          mode: activeMode,
-          messages: finalMessages,
-          createdAt: currentInteraction?.createdAt || Date.now(),
-          updatedAt: Date.now(),
-        },
-        activeId || undefined
-      );
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+      }
 
-      setActiveId(savedDocId);
-      setSaveStatus('saved');
-
-      onSaveSuccess({
-        id: savedDocId,
-        userId: user.uid,
+      const interactionPayload = {
         title: derivedTitle,
         initialPrompt: finalMessages[0]?.content || pendingText,
         summary: finalSummary,
         tags: combinedTags,
         mode: activeMode,
         messages: finalMessages,
+        draftInput: '',
+        location: location
+          ? {
+              latitude: location.latitude,
+              longitude: location.longitude,
+              name: location.name,
+              address: location.address,
+              accuracy: location.accuracy,
+              timestamp: location.timestamp || Date.now(),
+            }
+          : undefined,
         createdAt: currentInteraction?.createdAt || Date.now(),
         updatedAt: Date.now(),
+      };
+
+      const savedDocId = await saveUserInteraction(
+        user.uid,
+        interactionPayload,
+        activeId || undefined
+      );
+
+      setActiveId(savedDocId);
+      setSaveStatus('saved');
+      setLastSavedAt(Date.now());
+      lastSavedSnapshotRef.current = createSnapshot(
+        derivedTitle,
+        '',
+        activeMode,
+        combinedTags,
+        location,
+        finalMessages.length
+      );
+
+      onSaveSuccess({
+        ...interactionPayload,
+        id: savedDocId,
+        userId: user.uid,
       });
     } catch (err: any) {
       console.error('Reflection processing or persistence failed:', err);
@@ -339,29 +624,35 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               onBlur={() => {
-                if (activeId && title.trim()) {
-                  saveUserInteraction(
-                    user.uid,
-                    {
-                      title: title.trim(),
-                      initialPrompt: messages[0]?.content || 'Reflection',
-                      mode,
-                      messages,
-                      tags,
-                      summary,
-                      createdAt: currentInteraction?.createdAt || Date.now(),
-                      updatedAt: Date.now(),
-                    },
-                    activeId
-                  ).catch((err) => console.error('Failed to update title:', err));
+                if (title.trim() || inputText.trim() || messages.length > 0) {
+                  performAutosave(true);
                 }
               }}
               className="font-serif text-base sm:text-lg font-semibold text-natural-text placeholder-natural-text-light bg-transparent border-none focus:outline-none focus:ring-0 w-full"
             />
           </div>
 
-          {/* Mode Selector & Status */}
-          <div className="flex items-center gap-2">
+          {/* Location Pin, Mode Selector, Model Badge & Actions */}
+          <div className="flex items-center flex-wrap gap-2">
+            {/* Location Pin Button */}
+            <button
+              id="toolbar-location-pin-btn"
+              type="button"
+              onClick={() => setShowLocationModal(true)}
+              className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors cursor-pointer ${
+                location
+                  ? 'border-[#c8d4b8] bg-[#eef1e6] text-natural-olive shadow-2xs hover:bg-[#e4ebd9]'
+                  : 'border-natural-border bg-natural-surface text-natural-text-muted hover:border-natural-olive hover:text-natural-text'
+              }`}
+              title={location ? `Pinned: ${location.name || location.address || 'Location set'}` : 'Pin current location'}
+            >
+              <MapPin className={`h-3.5 w-3.5 ${location ? 'text-natural-olive' : 'text-natural-text-light'}`} />
+              <span className="max-w-[120px] truncate">
+                {location ? location.name || 'Pinned Location' : 'Pin Location'}
+              </span>
+            </button>
+
+            {/* Mode Selector */}
             <div className="inline-flex rounded-lg border border-natural-border bg-natural-surface p-0.5 text-xs">
               <button
                 onClick={() => setMode('reflect')}
@@ -399,7 +690,7 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
             </div>
 
             {/* Model Badge */}
-            <span className="hidden lg:inline-flex items-center gap-1 rounded-md bg-natural-surface border border-natural-border px-2 py-1 text-[11px] font-mono text-natural-text-muted">
+            <span className="hidden xl:inline-flex items-center gap-1 rounded-md bg-natural-surface border border-natural-border px-2 py-1 text-[11px] font-mono text-natural-text-muted">
               <Sparkles className="h-3 w-3 text-natural-olive" />
               {modelUsedBadge}
             </span>
@@ -423,57 +714,136 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
           </div>
         </div>
 
-        {/* Tags Bar */}
-        <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-natural-text-muted">
-          <Tag className="h-3.5 w-3.5 text-natural-text-light" />
-          {tags.map((t) => (
-            <span
-              key={t}
-              className="inline-flex items-center gap-1 rounded-md bg-natural-surface border border-natural-border px-2 py-0.5 text-[11px] font-medium text-natural-text"
-            >
-              #{t}
-              <button
-                onClick={() => handleRemoveTag(t)}
-                className="text-natural-text-light hover:text-natural-text ml-0.5 cursor-pointer"
+        {/* Tags and Autosave Status Bar */}
+        <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-natural-text-muted">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Tag className="h-3.5 w-3.5 text-natural-text-light" />
+            {tags.map((t) => (
+              <span
+                key={t}
+                className="inline-flex items-center gap-1 rounded-md bg-natural-surface border border-natural-border px-2 py-0.5 text-[11px] font-medium text-natural-text"
               >
-                &times;
+                #{t}
+                <button
+                  onClick={() => handleRemoveTag(t)}
+                  className="text-natural-text-light hover:text-natural-text ml-0.5 cursor-pointer"
+                >
+                  &times;
+                </button>
+              </span>
+            ))}
+
+            {showTagInput ? (
+              <input
+                type="text"
+                placeholder="tag + Enter"
+                value={tagInput}
+                onChange={(e) => setTagInput(e.target.value)}
+                onKeyDown={handleAddTag}
+                onBlur={() => setShowTagInput(false)}
+                autoFocus
+                className="w-24 rounded border border-natural-border bg-natural-card px-1.5 py-0.5 text-[11px] text-natural-text focus:outline-none focus:ring-1 focus:ring-natural-olive"
+              />
+            ) : (
+              <button
+                onClick={() => setShowTagInput(true)}
+                className="rounded border border-dashed border-natural-border px-1.5 py-0.5 text-[11px] text-natural-text-muted hover:border-natural-olive hover:text-natural-text cursor-pointer"
+              >
+                + Tag
               </button>
-            </span>
-          ))}
+            )}
+          </div>
 
-          {showTagInput ? (
-            <input
-              type="text"
-              placeholder="tag + Enter"
-              value={tagInput}
-              onChange={(e) => setTagInput(e.target.value)}
-              onKeyDown={handleAddTag}
-              onBlur={() => setShowTagInput(false)}
-              autoFocus
-              className="w-24 rounded border border-natural-border bg-natural-card px-1.5 py-0.5 text-[11px] text-natural-text focus:outline-none focus:ring-1 focus:ring-natural-olive"
-            />
-          ) : (
-            <button
-              onClick={() => setShowTagInput(true)}
-              className="rounded border border-dashed border-natural-border px-1.5 py-0.5 text-[11px] text-natural-text-muted hover:border-natural-olive hover:text-natural-text cursor-pointer"
-            >
-              + Tag
-            </button>
-          )}
-
-          {saveStatus === 'saved' && (
-            <span className="ml-auto flex items-center gap-1 text-[11px] text-[#5a7d52] font-medium">
-              <Check className="h-3 w-3" />
-              Saved to Firestore
-            </span>
-          )}
-          {saveStatus === 'saving' && (
-            <span className="ml-auto flex items-center gap-1 text-[11px] text-amber-700">
-              <RefreshCw className="h-3 w-3 animate-spin" />
-              Persisting...
-            </span>
-          )}
+          {/* Autosave Visual Status Indicator */}
+          <div id="autosave-status-indicator" className="flex items-center gap-1.5 text-[11px]">
+            {saveStatus === 'saving' && (
+              <span className="inline-flex items-center gap-1 text-amber-700 font-medium">
+                <RefreshCw className="h-3 w-3 animate-spin" />
+                <span>Autosaving...</span>
+              </span>
+            )}
+            {saveStatus === 'saved' && (
+              <span className="inline-flex items-center gap-1 text-[#5a7d52] font-medium" title={lastSavedAt ? `Saved at ${new Date(lastSavedAt).toLocaleTimeString()}` : 'Saved to Firestore'}>
+                <Check className="h-3 w-3" />
+                <span>Saved</span>
+              </span>
+            )}
+            {saveStatus === 'unsaved' && (
+              <div className="inline-flex items-center gap-1.5">
+                <span className="flex items-center gap-1 text-natural-text-muted">
+                  <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse" />
+                  <span>Unsaved edits</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => performAutosave(true)}
+                  className="inline-flex items-center gap-1 rounded bg-natural-surface border border-natural-border px-1.5 py-0.5 text-[10px] text-natural-text hover:border-natural-olive hover:text-natural-olive cursor-pointer"
+                >
+                  <Save className="h-2.5 w-2.5" />
+                  Save now
+                </button>
+              </div>
+            )}
+            {saveStatus === 'error' && (
+              <div className="inline-flex items-center gap-1 text-[#b84a37]">
+                <AlertCircle className="h-3 w-3" />
+                <span>Save failed</span>
+                <button
+                  type="button"
+                  onClick={() => performAutosave(true)}
+                  className="underline font-semibold cursor-pointer ml-1"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+          </div>
         </div>
+
+        {/* Pinned Location Banner (when location exists) */}
+        {location && (
+          <div
+            id="pinned-location-banner"
+            className="mt-2.5 flex items-center justify-between gap-3 rounded-xl bg-natural-surface border border-[#d6dec7] px-3 py-2 text-xs text-natural-text"
+          >
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[#eef1e6] text-natural-olive border border-[#d6dec7]">
+                <MapPin className="h-4 w-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 font-medium text-natural-text">
+                  <span className="truncate">{location.name || 'Pinned Location'}</span>
+                  <span className="shrink-0 text-[10px] font-mono text-natural-text-light">
+                    ({location.latitude.toFixed(4)}°, {location.longitude.toFixed(4)}°)
+                  </span>
+                </div>
+                {location.address && (
+                  <p className="truncate text-[11px] text-natural-text-muted mt-0.5">
+                    {location.address}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => setShowLocationModal(true)}
+                className="rounded-lg border border-natural-border bg-natural-card px-2 py-1 text-[11px] font-medium text-natural-text hover:border-natural-olive hover:text-natural-olive transition-colors cursor-pointer"
+              >
+                Change Pin
+              </button>
+              <button
+                type="button"
+                onClick={() => setLocation(undefined)}
+                className="rounded-lg p-1 text-natural-text-light hover:text-[#b84a37] hover:bg-[#b84a37]/10 transition-colors cursor-pointer"
+                title="Remove location"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Error Banner if error occurred */}
@@ -657,6 +1027,24 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
               </div>
 
               <div className="flex items-center gap-2">
+                {/* Composer Quick Location Button */}
+                <button
+                  id="composer-location-btn"
+                  type="button"
+                  onClick={() => setShowLocationModal(true)}
+                  className={`inline-flex items-center gap-1 rounded-xl border px-2.5 py-2 text-xs font-medium transition-colors cursor-pointer ${
+                    location
+                      ? 'border-[#c8d4b8] bg-[#eef1e6] text-natural-olive hover:bg-[#e4ebd9]'
+                      : 'border-natural-border bg-natural-surface text-natural-text-muted hover:border-natural-olive hover:text-natural-text'
+                  }`}
+                  title={location ? `Location pinned: ${location.name || location.address || 'Click to view/change'}` : 'Pin location to this reflection'}
+                >
+                  <MapPin className={`h-3.5 w-3.5 ${location ? 'text-natural-olive' : 'text-natural-text-light'}`} />
+                  <span className="hidden sm:inline">
+                    {location ? location.name || 'Location Pinned' : 'Pin Location'}
+                  </span>
+                </button>
+
                 <button
                   id="submit-reflection-btn"
                   onClick={() => handleSendPrompt()}
@@ -681,6 +1069,18 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Location Picker & Map Modal */}
+      <LocationPickerModal
+        isOpen={showLocationModal}
+        onClose={() => setShowLocationModal(false)}
+        currentLocation={location}
+        onSaveLocation={(newLoc) => {
+          setLocation(newLoc);
+          // Mark as unsaved so debounced autosave commits it to Firestore
+          setSaveStatus('unsaved');
+        }}
+      />
 
       {/* Delete Confirmation Modal */}
       {showDeleteModal && (

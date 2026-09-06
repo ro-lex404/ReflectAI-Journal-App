@@ -11,6 +11,7 @@ import {
   ChevronRight,
   RefreshCw,
   X,
+  MapPin,
 } from 'lucide-react';
 import type { Interaction, ReflectionMode } from '../types';
 
@@ -207,14 +208,30 @@ export const HistorySidebar: React.FC<HistorySidebarProps> = ({
 
                 {/* Excerpt / Summary */}
                 <p className="text-[11px] text-natural-text-muted line-clamp-2 leading-relaxed">
-                  {item.summary || item.initialPrompt || 'No excerpt available.'}
+                  {item.summary || item.draftInput || item.initialPrompt || 'No excerpt available.'}
                 </p>
 
-                {/* Tags & Mode Badges */}
+                {/* Tags, Mode & Location Badges */}
                 <div className="flex items-center justify-between gap-1 pt-1 mt-0.5 border-t border-natural-border-subtle">
-                  <span className="inline-flex items-center rounded bg-natural-surface border border-natural-border px-1.5 py-0.5 text-[10px] font-medium text-natural-text-muted capitalize">
-                    {item.mode || 'reflect'}
-                  </span>
+                  <div className="flex items-center gap-1 overflow-hidden">
+                    {(!item.messages || item.messages.length === 0) && (
+                      <span className="inline-flex items-center rounded bg-amber-50 border border-amber-200 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">
+                        Draft
+                      </span>
+                    )}
+                    <span className="inline-flex items-center rounded bg-natural-surface border border-natural-border px-1.5 py-0.5 text-[10px] font-medium text-natural-text-muted capitalize">
+                      {item.mode || 'reflect'}
+                    </span>
+                    {item.location && (
+                      <span
+                        className="inline-flex items-center gap-0.5 rounded bg-[#eef1e6] border border-[#d6dec7] px-1.5 py-0.5 text-[10px] font-medium text-natural-olive truncate max-w-[95px]"
+                        title={item.location.name || item.location.address || `${item.location.latitude.toFixed(4)}, ${item.location.longitude.toFixed(4)}`}
+                      >
+                        <MapPin className="h-2.5 w-2.5 shrink-0" />
+                        <span className="truncate">{item.location.name || item.location.address || `${item.location.latitude.toFixed(2)}°`}</span>
+                      </span>
+                    )}
+                  </div>
 
                   {item.tags && item.tags.length > 0 && (
                     <div className="flex items-center gap-1 overflow-hidden">

@@ -7,6 +7,15 @@ export interface ChatMessage {
   timestamp: number;
 }
 
+export interface JournalLocation {
+  latitude: number;
+  longitude: number;
+  name?: string;
+  address?: string;
+  accuracy?: number;
+  timestamp?: number;
+}
+
 export interface Interaction {
   id: string;
   userId: string;
@@ -16,6 +25,8 @@ export interface Interaction {
   tags: string[];
   mode: ReflectionMode;
   messages: ChatMessage[];
+  location?: JournalLocation;
+  draftInput?: string;
   createdAt: number;
   updatedAt: number;
 }
