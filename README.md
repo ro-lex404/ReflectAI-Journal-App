@@ -1,6 +1,6 @@
 # ReflectAI Journal — User-Authenticated Personal Reflection & AI Journal
 
-ReflectAI is a secure, user-authenticated journaling and personal reflection web application powered by **Gemini 3.6 Flash** and **Cloud Firestore**. Every reflection, conversation turn, and executive summary is cryptographically isolated to the individual authenticated user under `/users/{userId}/interactions/{interactionId}`.
+ReflectAI is a secure, user-authenticated journaling and personal reflection web application powered by **Gemini 3.6 Flash**, **Google Cloud Secret Manager**, and **Cloud Firestore**. Every reflection, conversation turn, and executive summary is cryptographically isolated to the individual authenticated user under `/users/{userId}/interactions/{interactionId}`.
 
 ---
 
@@ -11,7 +11,7 @@ ReflectAI is a secure, user-authenticated journaling and personal reflection web
 │                          Browser Client                                │
 │  - Firebase Authentication (Google Sign-In Popup)                      │
 │  - Cloud Firestore Client SDK (Direct owner-isolated read/write)       │
-│  - Zero raw passwords stored or transmitted                            │
+│  - Zero raw passwords or API credentials stored or transmitted         │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │
                          REST API   │  (No API keys in client)
@@ -19,8 +19,10 @@ ReflectAI is a secure, user-authenticated journaling and personal reflection web
 ┌────────────────────────────────────────────────────────────────────────┐
 │                        Node.js Express Server                          │
 │  - Strict request deserialization & null-safe payload ingestion        │
-│  - Secret Manager / Env Var injection (GEMINI_API_KEY)                 │
+│  - Programmatic Google Cloud Secret Manager SDK (@google-cloud/...)   │
+│  - In-memory decrypted secret caching with env var fallback           │
 │  - Resilient Gemini Fallback Ladder (gemini-3.6-flash -> fallbacks)    │
+│  - Google Geolocation API proxy endpoint                               │
 │  - Serves compiled Vite SPA in production                              │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │
@@ -28,7 +30,7 @@ ReflectAI is a secure, user-authenticated journaling and personal reflection web
 ┌────────────────────────────────────────────────────────────────────────┐
 │                         Google Cloud Platform                          │
 │  - Cloud Firestore: Document Isolation (request.auth.uid == userId)   │
-│  - Secret Manager: Zero-hardcoding credential hygiene                  │
+│  - Secret Manager: Zero-hardcoding credential hygiene via IAM RBAC    │
 │  - Cloud Run: Containerized serverless deployment                      │
 └────────────────────────────────────────────────────────────────────────┘
 ```
@@ -61,19 +63,77 @@ gcloud services enable \
 
 ## 2. Secret Management Setup (Zero-Hardcoding Hygiene)
 
-We use Google Cloud Secret Manager to manage the `GEMINI_API_KEY` securely without checking secrets into source code:
+ReflectAI utilizes **Google Cloud Secret Manager** to manage operational credentials (`GEMINI_API_KEY`, `GOOGLE_MAPS_API_KEY`) with zero hardcoding in the codebase.
+
+### Step 1: Create and Populate Secrets in Secret Manager
 
 ```bash
-# 1. Create and populate the secret
+# 1. Create and populate GEMINI_API_KEY
 gcloud secrets create GEMINI_API_KEY --replication-policy="automatic"
 echo -n "YOUR_GEMINI_API_KEY" | gcloud secrets versions add GEMINI_API_KEY --data-file=-
 
-# 2. Grant the default Cloud Run compute service account access to read the secret
+# 2. (Optional) Create and populate GOOGLE_MAPS_API_KEY for geolocation
+gcloud secrets create GOOGLE_MAPS_API_KEY --replication-policy="automatic"
+echo -n "YOUR_GOOGLE_MAPS_API_KEY" | gcloud secrets versions add GOOGLE_MAPS_API_KEY --data-file=-
+```
+
+### Step 2: Grant Secret Manager Access to Cloud Run Service Account
+
+```bash
 export PROJECT_NUMBER=$(gcloud projects describe $PROJECT_ID --format="value(projectNumber)")
 
+# Grant the default Cloud Run compute service account access to read the secret
 gcloud secrets add-iam-policy-binding GEMINI_API_KEY \
   --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
   --role="roles/secretmanager.secretAccessor"
+
+gcloud secrets add-iam-policy-binding GOOGLE_MAPS_API_KEY \
+  --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+### Step 3: Programmatic Retrieval Architecture (`src/server/secrets.ts`)
+
+The backend imports the official `@google-cloud/secret-manager` SDK and implements a resilient dual-mode resolver:
+
+1. **In-Memory Cache**: Cached decrypted secret payloads prevent repeated network round-trips on every request.
+2. **Dynamic API Access**: Dynamically accesses `projects/${projectId}/secrets/${secretId}/versions/latest`.
+3. **Graceful Fallback**: If running in a local environment without Application Default Credentials, it seamlessly falls back to `process.env[secretId]` without crashing the server.
+
+```typescript
+import { SecretManagerServiceClient } from '@google-cloud/secret-manager';
+
+export async function accessSecret(secretId: string, versionId: string = 'latest'): Promise<string> {
+  // 1. Check in-memory cache
+  if (secretCache.has(secretId)) return secretCache.get(secretId)!;
+
+  // 2. Fetch from Secret Manager API
+  const projectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.PROJECT_ID;
+  if (projectId) {
+    try {
+      const client = new SecretManagerServiceClient();
+      const [response] = await client.accessSecretVersion({
+        name: `projects/${projectId}/secrets/${secretId}/versions/${versionId}`,
+      });
+      const payload = response.payload?.data?.toString();
+      if (payload) {
+        secretCache.set(secretId, payload);
+        return payload;
+      }
+    } catch (err) {
+      console.warn(`[Secret Manager] Falling back to environment variable for "${secretId}"`);
+    }
+  }
+
+  // 3. Fallback to process.env
+  const envVal = process.env[secretId];
+  if (envVal) {
+    secretCache.set(secretId, envVal);
+    return envVal;
+  }
+
+  throw new Error(`Secret "${secretId}" could not be resolved.`);
+}
 ```
 
 ---
@@ -110,7 +170,7 @@ firebase deploy --only firestore:rules
 # Install dependencies
 npm install
 
-# Configure environment variables in .env
+# Configure environment variables in .env (for local fallback)
 cp .env.example .env
 # Set GEMINI_API_KEY in .env
 
@@ -130,12 +190,13 @@ Build and deploy the application container directly to Google Cloud Run:
 export SERVICE_NAME="reflectai-app"
 export REGION="asia-southeast1" # or your preferred region e.g. us-central1
 
-# Deploy container to Cloud Run with Secret Manager binding
+# Deploy container to Cloud Run with Secret Manager binding and Project ID
 gcloud run deploy $SERVICE_NAME \
   --source . \
   --platform managed \
   --region $REGION \
   --allow-unauthenticated \
+  --set-env-vars GOOGLE_CLOUD_PROJECT=$PROJECT_ID \
   --set-secrets GEMINI_API_KEY=GEMINI_API_KEY:latest \
   --port 3000
 ```
@@ -168,3 +229,4 @@ The backend implements an automated fallback ladder to ensure uninterrupted avai
 4. **Deep Reasoning Fallback**: `gemini-3.7-flash`
 
 Recoverable HTTP status codes (`503 UNAVAILABLE`, `429 RESOURCE_EXHAUSTED`, `404 NOT_FOUND`, `500 INTERNAL`) trigger immediate graceful failover down the chain.
+

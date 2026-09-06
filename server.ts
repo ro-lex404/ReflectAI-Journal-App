@@ -3,6 +3,7 @@ import path from 'path';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
+import { accessSecret, isSecretAvailable } from './src/server/secrets';
 
 dotenv.config();
 
@@ -13,13 +14,13 @@ const PORT = 3000;
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Initialize Google GenAI client lazily or safely with API Key
+// Initialize Google GenAI client lazily or safely with API Key from Secret Manager or env
 let aiClient: GoogleGenAI | null = null;
-function getGenAI(): GoogleGenAI {
+async function getGenAI(): Promise<GoogleGenAI> {
   if (!aiClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = await accessSecret('GEMINI_API_KEY');
     if (!apiKey) {
-      throw new Error('GEMINI_API_KEY environment variable is not configured.');
+      throw new Error('GEMINI_API_KEY could not be resolved from Secret Manager or environment.');
     }
     aiClient = new GoogleGenAI({ apiKey });
   }
@@ -66,7 +67,7 @@ async function generateContentWithFallback(params: {
   systemInstruction?: string;
   temperature?: number;
 }): Promise<{ text: string; modelUsed: string }> {
-  const ai = getGenAI();
+  const ai = await getGenAI();
   let lastError: any = null;
 
   for (let i = 0; i < MODEL_FALLBACK_LADDER.length; i++) {
@@ -108,7 +109,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
     timestamp: Date.now(),
-    geminiKeyConfigured: Boolean(process.env.GEMINI_API_KEY),
+    geminiKeyConfigured: isSecretAvailable('GEMINI_API_KEY'),
   });
 });
 
@@ -236,16 +237,21 @@ Your goal in 'brainstorm' mode:
 app.post('/api/geolocation/lookup', async (req: Request, res: Response) => {
   try {
     const rawBody = req.body && typeof req.body === 'object' ? req.body : {};
-    const apiKey = (
-      process.env.GOOGLE_MAPS_API_KEY ||
-      process.env.VITE_GOOGLE_MAPS_API_KEY ||
-      rawBody.apiKey ||
-      ''
-    ).trim();
+    let apiKey = '';
+    try {
+      apiKey = (await accessSecret('GOOGLE_MAPS_API_KEY')).trim();
+    } catch {
+      apiKey = (
+        process.env.GOOGLE_MAPS_API_KEY ||
+        process.env.VITE_GOOGLE_MAPS_API_KEY ||
+        rawBody.apiKey ||
+        ''
+      ).trim();
+    }
 
     if (!apiKey) {
       return res.status(400).json({
-        error: 'Google Geolocation API key is not configured in server environment or request.',
+        error: 'Google Geolocation API key is not configured in Secret Manager or server environment.',
       });
     }
 
